@@ -1,139 +1,295 @@
 """
-RAG 质量自动评估器
-===================
-用 LLM-as-Judge 评估 RAG 回答的三个维度：忠实度、相关性、完整性。
-输出 0-10 评分 + 改进建议。
+RAG 质量评估器 — 核心引擎
+=========================
+LLM-as-Judge：用 LLM 给 RAG 回答打分的三维度评测。
 
-运行：py evaluator.py
+维度：
+  1. 忠实度 (Faithfulness) — 回答是否基于参考资料，有无编造？
+  2. 相关性 (Relevance)    — 回答是否直接回应了用户问题？
+  3. 完整性 (Completeness) — 回答是否覆盖了所有方面？
+
+用法：
+    from evaluator import RAGEvaluator
+    eval = RAGEvaluator()
+    result = eval.evaluate(question, answer, references)
+    print(result["overall"])  # 综合评分 0-10
 """
 
 import os
 import json
-from openai import OpenAI
+import time
+from typing import Optional
 
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_KEY", ""),
-    base_url="https://api.deepseek.com"
-)
+# 尝试导入 openai，不可用时给出友好提示
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
-# ═══ 评估 Prompt ═══
 
-EVAL_PROMPT = """你是 RAG 系统质量评审专家。根据以下三个维度，评估给定回答的质量。
+EVAL_PROMPT = """You are a RAG system quality evaluation expert. Evaluate the given answer based on three dimensions.
 
-【评估维度】
-1. 忠实度（1-10）：回答是否基于参考资料，有没有编造内容？
-2. 相关性（1-10）：回答是否直接回应了用户问题？
-3. 完整性（1-10）：回答是否覆盖了问题要求的所有方面？
+[Evaluation Dimensions]
+1. Faithfulness (1-10): Is the answer based on the provided references? Any fabricated content?
+2. Relevance (1-10): Does the answer directly address the user's question?
+3. Completeness (1-10): Does the answer cover all aspects required by the question?
 
-【评分标准】
-- 8-10：优秀，无明显问题
-- 5-7：一般，有明显不足
-- 1-4：很差，多处错误或遗漏
+[Scoring Criteria]
+- 8-10: Excellent, no obvious issues
+- 5-7: Average, notable shortcomings
+- 1-4: Poor, multiple errors or omissions
 
-【输出格式】
-严格输出 JSON，不要其他内容：
+[Output Format]
+Strictly output JSON only, no other text:
 {
-  "faithfulness": {"score": 0, "reason": "一句话说明"},
-  "relevance": {"score": 0, "reason": "一句话说明"},
-  "completeness": {"score": 0, "reason": "一句话说明"},
+  "faithfulness": {"score": 0, "reason": "one sentence explanation"},
+  "relevance": {"score": 0, "reason": "one sentence explanation"},
+  "completeness": {"score": 0, "reason": "one sentence explanation"},
   "overall": 0,
-  "improvements": ["改进建议1", "改进建议2"]
+  "improvements": ["suggestion 1", "suggestion 2"]
 }"""
 
 
-def evaluate(question: str, answer: str, references: list[str] = None) -> dict:
+class RAGEvaluator:
     """
-    评估 RAG 回答质量。
+    RAG 质量评估器。
 
-    参数:
-        question: 用户问题
-        answer: RAG 系统给出的回答
-        references: 检索到的参考文档列表
-
-    返回:
-        dict: 包含 faithfulness/relevance/completeness 评分和理由
+    支持两种模式：
+      - live: 调用真实 LLM API（DeepSeek/GPT 等）
+      - mock: 用规则打分（离线测试用）
     """
-    ref_text = ""
-    if references:
-        ref_text = "【参考资料】\n" + "\n---\n".join(references)
 
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{
-            "role": "system",
-            "content": EVAL_PROMPT
-        }, {
-            "role": "user",
-            "content": f"""用户问题：{question}
+    def __init__(self, api_key: str = "", base_url: str = "https://api.deepseek.com",
+                 model: str = "deepseek-chat", mock: bool = False):
+        """
+        Args:
+            api_key: LLM API Key（默认读 DEEPSEEK_KEY 环境变量）
+            base_url: API 地址
+            model: 模型名称
+            mock: True=使用规则打分（不调 API），False=调用真实 LLM
+        """
+        self.mock = mock
+        self.model = model
 
-{ref_text}
+        if not mock:
+            if OpenAI is None:
+                raise ImportError("请安装 openai: pip install openai")
+            key = api_key or os.getenv("DEEPSEEK_KEY", "")
+            if not key:
+                raise ValueError("请设置 DEEPSEEK_KEY 环境变量或传入 api_key 参数")
+            self.client = OpenAI(api_key=key, base_url=base_url)
+        else:
+            self.client = None
 
-【RAG 系统回答】
+        self._stats = {"total_evals": 0, "total_time_ms": 0, "total_cost_estimate": 0.0}
+
+    # ── 核心评估 ────────────────────────
+
+    def evaluate(self, question: str, answer: str,
+                 references: list[str] = None) -> dict:
+        """
+        评估一次 RAG 回答。
+
+        Args:
+            question: 用户问题
+            answer: RAG 系统给出的回答
+            references: 检索到的参考文档（可选但强烈建议提供）
+
+        Returns:
+            {
+                "faithfulness": {"score": int, "reason": str},
+                "relevance": {"score": int, "reason": str},
+                "completeness": {"score": int, "reason": str},
+                "overall": int,
+                "improvements": [str, ...],
+                "cost_estimate": float,  # 预估 API 费用（美元）
+                "duration_ms": int,
+            }
+        """
+        t0 = time.perf_counter()
+
+        if self.mock:
+            result = self._mock_evaluate(question, answer, references)
+        else:
+            result = self._llm_evaluate(question, answer, references)
+
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        result["duration_ms"] = elapsed
+
+        self._stats["total_evals"] += 1
+        self._stats["total_time_ms"] += elapsed
+
+        return result
+
+    def _llm_evaluate(self, question: str, answer: str,
+                      references: list[str] = None) -> dict:
+        """调用 LLM 进行评估"""
+        # 构建参考资料文本
+        ref_text = ""
+        if references:
+            ref_parts = []
+            for i, ref in enumerate(references, 1):
+                ref_parts.append(f"[Ref {i}] {ref}")
+            ref_text = "\n".join(ref_parts)
+
+        user_content = f"""User Question: {question}
+
+{ref_text if ref_text else '(No references provided — evaluate based on general knowledge consistency)'}
+
+[RAG System Answer]
 {answer}
 
-请评估以上回答的质量。"""
-        }],
-        temperature=0,
-        response_format={"type": "json_object"}
-    )
-    return json.loads(response.choices[0].message.content)
+Please evaluate the above answer quality."""
 
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": EVAL_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
 
-def print_report(result: dict):
-    """格式化打印评估报告"""
-    def bar(score):
-        return "█" * score + "░" * (10 - score)
+        content = response.choices[0].message.content
+        result = json.loads(content)
 
-    print("\n" + "=" * 55)
-    print("📊 RAG 质量评估报告")
-    print("=" * 55)
+        # 估算费用（DeepSeek 约 $0.28/1M input tokens）
+        usage = response.usage
+        cost = (usage.prompt_tokens * 0.28 + usage.completion_tokens * 1.10) / 1_000_000
+        result["cost_estimate"] = round(cost, 6)
+        result["tokens_used"] = usage.total_tokens
 
-    for key, label in [("faithfulness", "忠实度"), ("relevance", "相关性"), ("completeness", "完整性")]:
-        s = result[key]["score"]
-        print(f"\n{label}: {s}/10 {bar(s)}")
-        print(f"  {result[key]['reason']}")
+        self._stats["total_cost_estimate"] += cost
+        return result
 
-    overall = result.get("overall", 0)
-    print(f"\n{'─' * 55}")
-    print(f"📈 综合评分: {overall}/10 {'⭐' * min(5, overall // 2)}")
+    def _mock_evaluate(self, question: str, answer: str,
+                       references: list[str] = None) -> dict:
+        """
+        规则打分（不调 API，用于快速测试）。
 
-    improvements = result.get("improvements", [])
-    if improvements:
-        print(f"\n💡 改进建议:")
-        for i, imp in enumerate(improvements, 1):
-            print(f"  {i}. {imp}")
-    print("=" * 55)
+        简单的启发式规则：
+          - 忠实度：检查回答中的数字/事实是否在参考文档中出现
+          - 相关性：检查回答是否包含问题关键词
+          - 完整性：检查回答长度和覆盖度
+        """
+        q_words = set(question.lower().split())
+        a_words = set(answer.lower().split())
+        ref_words = set()
+        if references:
+            for r in references:
+                ref_words.update(r.lower().split())
 
+        # 相关性：问题关键词在回答中的覆盖率
+        q_covered = q_words & a_words
+        relevance = min(10, max(1, int(len(q_covered) / max(len(q_words), 1) * 10)))
 
-if __name__ == "__main__":
-    print("=" * 55)
-    print("🔍 RAG 质量自动评估器")
-    print("=" * 55)
-    print("用 LLM-as-Judge 评估回答质量（忠实度/相关性/完整性）")
-    print()
+        # 忠实度：回答内容在参考文档中的比例
+        if ref_words:
+            a_in_ref = a_words & ref_words
+            faithfulness = min(10, max(1, int(len(a_in_ref) / max(len(a_words), 1) * 12)))
+        else:
+            faithfulness = 5  # 无参考文档时默认为中
 
-    # Demo：模拟一个 RAG 系统的回答
-    question = "特斯拉 Model 2 的售价和续航是多少？"
+        # 完整性：回答长度
+        completeness = min(10, max(1, len(answer) // 40))
 
-    references = [
-        "特斯拉 Model 2 售价 2.5 万美元，续航 500 公里。",
-        "Model 2 是特斯拉最便宜的车型，2026 年 Q1 开始交付。"
-    ]
+        overall = round((faithfulness + relevance + completeness) / 3)
 
-    # 场景1：好回答
-    good_answer = "特斯拉 Model 2 售价 2.5 万美元，续航 500 公里，于 2026 年 Q1 开始交付。"
+        return {
+            "faithfulness": {
+                "score": faithfulness,
+                "reason": f"Mock: {len(a_words & ref_words) if ref_words else '?'} of {len(a_words)} answer words found in references"
+            },
+            "relevance": {
+                "score": relevance,
+                "reason": f"Mock: {len(q_covered)} of {len(q_words)} question keywords covered"
+            },
+            "completeness": {
+                "score": completeness,
+                "reason": f"Mock: answer length {len(answer)} chars"
+            },
+            "overall": overall,
+            "improvements": ["(Mock mode — use real LLM for actionable suggestions)"],
+            "cost_estimate": 0.0,
+        }
 
-    # 场景2：差回答（编造+遗漏）
-    bad_answer = "特斯拉 Model 2 售价 2 万美元，采用固态电池，续航 800 公里。"
+    # ── 批量评估 ────────────────────────
 
-    print("── 场景1：正确回答 ──")
-    print(f"问题: {question}")
-    print(f"回答: {good_answer}")
-    result = evaluate(question, good_answer, references)
-    print_report(result)
+    def evaluate_batch(self, test_cases: list[dict]) -> list[dict]:
+        """
+        批量评估多个测试用例。
 
-    print("\n\n── 场景2：编造+遗漏回答 ──")
-    print(f"问题: {question}")
-    print(f"回答: {bad_answer}")
-    result = evaluate(question, bad_answer, references)
-    print_report(result)
+        Args:
+            test_cases: [{"question": str, "answer": str, "references": [str]}, ...]
+
+        Returns:
+            [result_dict, ...] 每个 result 包含原始用例信息 + 评分
+        """
+        results = []
+        total = len(test_cases)
+        for i, tc in enumerate(test_cases, 1):
+            print(f"  [{i}/{total}] Evaluating: {tc['question'][:60]}...")
+            result = self.evaluate(
+                question=tc["question"],
+                answer=tc["answer"],
+                references=tc.get("references"),
+            )
+            result["_question"] = tc["question"]
+            result["_answer"] = tc["answer"][:200]
+            results.append(result)
+        return results
+
+    # ── 统计 ────────────────────────────
+
+    @property
+    def stats(self) -> dict:
+        return dict(self._stats)
+
+    def aggregate(self, results: list[dict]) -> dict:
+        """
+        聚合多轮评估结果。
+
+        Returns:
+            {
+                "count": 总数,
+                "avg_faithfulness": 均分,
+                "avg_relevance": 均分,
+                "avg_completeness": 均分,
+                "avg_overall": 均分,
+                "pass_rate": 综合 >= 7 的比例,
+                "worst_cases": 最差的 3 个,
+                "total_cost": 总费用,
+                "total_time_ms": 总耗时,
+            }
+        """
+        if not results:
+            return {}
+
+        n = len(results)
+        f_scores = [r["faithfulness"]["score"] for r in results]
+        r_scores = [r["relevance"]["score"] for r in results]
+        c_scores = [r["completeness"]["score"] for r in results]
+        o_scores = [r["overall"] for r in results]
+
+        # 找出最差的 3 个
+        ranked = sorted(results, key=lambda r: r["overall"])
+        worst = []
+        for r in ranked[:3]:
+            worst.append({
+                "question": r.get("_question", "?")[:80],
+                "overall": r["overall"],
+                "reason": r["faithfulness"]["reason"][:80],
+            })
+
+        return {
+            "count": n,
+            "avg_faithfulness": round(sum(f_scores) / n, 1),
+            "avg_relevance": round(sum(r_scores) / n, 1),
+            "avg_completeness": round(sum(c_scores) / n, 1),
+            "avg_overall": round(sum(o_scores) / n, 1),
+            "pass_rate": round(sum(1 for s in o_scores if s >= 7) / n * 100, 1),
+            "worst_cases": worst,
+            "total_cost": round(sum(r.get("cost_estimate", 0) for r in results), 4),
+            "total_time_ms": sum(r.get("duration_ms", 0) for r in results),
+        }
