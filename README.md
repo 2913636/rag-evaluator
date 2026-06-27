@@ -74,9 +74,3 @@ generate_html_report(agg, results)  # -> report.html
 | edge_cases | 2 | 逻辑错误问题、无参考资料 |
 | multi_hop | 2 | 多跳推理、优缺点对比 |
 
-## 面试价值
-
-- LLM-as-Judge 实战落地（评测体系核心能力）
-- RAG 评测三维度 + 聚合统计
-- 结构化输出（JSON Schema）
-- 工程化（批量评测 + 报告生成 + 自检验证）
